@@ -647,11 +647,18 @@ pub fn load_pr_session(key: &PrSessionKey) -> Result<Option<(PathBuf, ReviewSess
 
 /// Look up the persisted session this PR was last reviewed at when that was
 /// a different head (the PR was pushed to or rebased since). Returns `None`
-/// if no entry exists for the slug or the entry is already at `key`'s head.
+/// if no entry exists for the slug, the entry is already at `key`'s head, or
+/// it belongs to another repository or PR: slugs leave out the host, so the
+/// same `owner/repo#N` on two hosts shares an entry.
 pub fn load_previous_head_pr_session(key: &PrSessionKey) -> Result<Option<ReviewSession>> {
     Ok(
         load_manifest_pr_session(key, |head_sha| head_sha != key.head_sha)?
-            .map(|(_path, session)| session),
+            .map(|(_path, session)| session)
+            .filter(|session| {
+                session.pr_session_key.as_ref().is_some_and(|previous| {
+                    previous.repository == key.repository && previous.number == key.number
+                })
+            }),
     )
 }
 

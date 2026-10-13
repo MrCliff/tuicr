@@ -597,9 +597,10 @@ impl App {
             return Ok(crate::forge::pr_open::OpenedPullRequest { session, ..opened });
         }
         // First open since the head moved: carry the old head's review forward,
-        // as an in-app reload at a new head does.
-        match crate::persistence::load_previous_head_pr_session(&opened.key)? {
-            Some(previous) => {
+        // as an in-app reload at a new head does. Best-effort: an unreadable
+        // old-head session must not block the PR, so it opens fresh instead.
+        match crate::persistence::load_previous_head_pr_session(&opened.key) {
+            Ok(Some(previous)) => {
                 let session = Self::reviewed_state_carried_forward(
                     &previous,
                     opened.session.clone(),
@@ -607,7 +608,7 @@ impl App {
                 );
                 Ok(crate::forge::pr_open::OpenedPullRequest { session, ..opened })
             }
-            None => Ok(opened),
+            Ok(None) | Err(_) => Ok(opened),
         }
     }
 

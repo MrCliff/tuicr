@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use ignore::Match;
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
@@ -46,10 +46,12 @@ pub fn has_tuicrignore(repo_root: &Path) -> bool {
     repo_root.join(".tuicrignore").is_file()
 }
 
-/// `.tuicrignore` at the repository root, then every `.gitignore` from a
-/// path's own directory up to the root. The first of those with a matching
-/// rule decides, so a nested `.gitignore` can re-include what a parent one
-/// ignores, as it does for git.
+/// `.tuicrignore` at the repository root decides first. Otherwise the path
+/// is walked the way git walks it: top-down, each directory checked before
+/// anything inside it, so an excluded directory hides its contents and its
+/// own `.gitignore` is never read. Each component is matched against the
+/// `.gitignore` files of its ancestors, deepest first; the first file with a
+/// matching rule decides.
 struct Matcher<'a> {
     repo_root: &'a Path,
     tuicrignore: Option<Gitignore>,
@@ -67,33 +69,50 @@ impl<'a> Matcher<'a> {
     }
 
     fn is_ignored(&mut self, path: &Path) -> bool {
-        if let Some(decided) = self.tuicrignore.as_ref().and_then(|m| decision(m, path)) {
+        if let Some(decided) = self.tuicrignore.as_ref().and_then(|m| {
+            match m.matched_path_or_any_parents(path, false) {
+                Match::None => None,
+                matched => Some(matched.is_ignore()),
+            }
+        }) {
             return decided;
         }
+        // Diff paths are repo-relative; anything else (`..`, absolute) would
+        // read `.gitignore` files outside the repository.
+        if !path.components().all(|c| matches!(c, Component::Normal(_))) {
+            return false;
+        }
+        let mut prefix = PathBuf::new();
+        let mut components = path.components().peekable();
+        while let Some(component) = components.next() {
+            prefix.push(component);
+            let is_dir = components.peek().is_some();
+            if self.excludes(&prefix, is_dir) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Whether the `.gitignore` files above `path` exclude it, the deepest
+    /// file with a matching rule deciding.
+    fn excludes(&mut self, path: &Path, is_dir: bool) -> bool {
         for dir in path.ancestors().skip(1) {
             let repo_root = self.repo_root;
             let gitignore = self.gitignores.entry(dir.to_path_buf()).or_insert_with(|| {
                 let dir = repo_root.join(dir);
                 load(&dir, &dir.join(".gitignore"))
             });
-            let Ok(relative) = path.strip_prefix(dir) else {
+            let (Some(gitignore), Ok(relative)) = (gitignore.as_ref(), path.strip_prefix(dir))
+            else {
                 continue;
             };
-            if let Some(decided) = gitignore.as_ref().and_then(|m| decision(m, relative)) {
-                return decided;
+            match gitignore.matched(relative, is_dir) {
+                Match::None => {}
+                matched => return matched.is_ignore(),
             }
         }
         false
-    }
-}
-
-/// `Some(true)` for an ignore rule, `Some(false)` for a `!` re-include, `None`
-/// when no rule in this file matches the path or one of its parents.
-fn decision(matcher: &Gitignore, path: &Path) -> Option<bool> {
-    match matcher.matched_path_or_any_parents(path, false) {
-        Match::None => None,
-        Match::Ignore(_) => Some(true),
-        Match::Whitelist(_) => Some(false),
     }
 }
 
@@ -306,6 +325,44 @@ mod tests {
         let files = vec![make_diff_file("web/yarn.lock")];
 
         assert_eq!(filter_diff_files(dir.path(), files).len(), 1);
+    }
+
+    #[test]
+    fn nested_gitignore_cannot_reinclude_inside_an_excluded_directory() {
+        let dir = tempdir().expect("failed to create temp dir");
+        fs::write(dir.path().join(".gitignore"), "logs/\n").expect("failed to write .gitignore");
+        fs::create_dir(dir.path().join("logs")).expect("failed to create logs/");
+        fs::write(dir.path().join("logs/.gitignore"), "!keep.txt\n")
+            .expect("failed to write logs/.gitignore");
+
+        let files = vec![make_diff_file("logs/keep.txt")];
+
+        assert!(filter_diff_files(dir.path(), files).is_empty());
+    }
+
+    #[test]
+    fn directory_reinclude_does_not_reinclude_files_inside_it() {
+        let dir = tempdir().expect("failed to create temp dir");
+        fs::write(dir.path().join(".gitignore"), "*.log\n").expect("failed to write .gitignore");
+        fs::create_dir(dir.path().join("sub")).expect("failed to create sub/");
+        fs::write(dir.path().join("sub/.gitignore"), "!sub2/\n")
+            .expect("failed to write sub/.gitignore");
+
+        let files = vec![make_diff_file("sub/sub2/a.log")];
+
+        assert!(filter_diff_files(dir.path(), files).is_empty());
+    }
+
+    #[test]
+    fn does_not_read_gitignore_outside_the_repository() {
+        let outer = tempdir().expect("failed to create temp dir");
+        fs::write(outer.path().join(".gitignore"), "*\n").expect("failed to write .gitignore");
+        let repo = outer.path().join("repo");
+        fs::create_dir(&repo).expect("failed to create repo/");
+
+        let files = vec![make_diff_file("../escape.rs")];
+
+        assert_eq!(filter_diff_files(&repo, files).len(), 1);
     }
 
     #[test]
